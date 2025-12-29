@@ -4,19 +4,23 @@ import Logging
 public final class MCPProtocolHandler {
     private let swiftLanguageServer: SwiftLanguageServer
     private let projectAnalyzer: ProjectAnalyzer
+    private let symbolSearchEngine: SymbolSearchEngine
     private let projectMemory: IntelligentProjectMemory
     private let documentationGenerator: DocumentationGenerator
     private let iOSFrameworkAnalyzer: iOSFrameworkAnalysisEngine
     private let templateGenerator: TemplateGenerator
     private let logger: Logger
-    
+
     public init(swiftLanguageServer: SwiftLanguageServer, logger: Logger) {
         self.swiftLanguageServer = swiftLanguageServer
         self.logger = logger
-        
+
         // Initialize project analyzer
         self.projectAnalyzer = ProjectAnalyzer(projectPath: swiftLanguageServer.workspaceURL, logger: logger)
-        
+
+        // Initialize symbol search engine for real symbol lookup
+        self.symbolSearchEngine = SymbolSearchEngine(projectPath: swiftLanguageServer.workspaceURL, logger: logger)
+
         // Initialize analysis modules
         self.projectMemory = IntelligentProjectMemory(projectPath: swiftLanguageServer.workspaceURL, logger: logger)
         self.documentationGenerator = DocumentationGenerator(projectPath: swiftLanguageServer.workspaceURL, logger: logger)
@@ -26,10 +30,17 @@ public final class MCPProtocolHandler {
     
     public func handleRequest(_ request: MCPRequest) async throws -> MCPResponse {
         logger.debug("Handling MCP request: \(request.method)")
-        
+
         switch request.method {
         case "initialize":
             return try await handleInitialize(request)
+        case "notifications/initialized":
+            // Handle initialized notification - this is sent by clients after initialization
+            return MCPResponse(
+                jsonrpc: "2.0",
+                id: request.id,
+                result: AnyCodable([String: String]())  // Empty object response
+            )
         case "tools/list":
             return try await handleToolsList(request)
         case "tools/call":
@@ -50,7 +61,7 @@ public final class MCPProtocolHandler {
             tools: ToolsCapability(listChanged: true),
             resources: ResourcesCapability(subscribe: true, listChanged: true)
         )
-        
+
         let result = InitializeResult(
             protocolVersion: "2024-11-05",
             capabilities: capabilities,
@@ -59,11 +70,11 @@ public final class MCPProtocolHandler {
                 version: "1.0.0"
             )
         )
-        
+
         return MCPResponse(
             jsonrpc: "2.0",
             id: request.id,
-            result: try JSONSerialization.data(withJSONObject: toDictionary(result))
+            result: AnyCodable(try toDictionary(result))
         )
     }
     
@@ -174,8 +185,13 @@ public final class MCPProtocolHandler {
                 description: "Perform comprehensive project analysis including architecture detection",
                 inputSchema: [
                     "type": "object",
-                    "properties": [:],
-                    "required": []
+                    "properties": [
+                        "project_path": [
+                            "type": "string",
+                            "description": "Path to the Swift project to analyze"
+                        ]
+                    ],
+                    "required": ["project_path"]
                 ]
             ),
             Tool(
@@ -183,8 +199,13 @@ public final class MCPProtocolHandler {
                 description: "Detect the architecture pattern used in the project",
                 inputSchema: [
                     "type": "object",
-                    "properties": [:],
-                    "required": []
+                    "properties": [
+                        "project_path": [
+                            "type": "string",
+                            "description": "Path to the Swift project to analyze"
+                        ]
+                    ],
+                    "required": ["project_path"]
                 ]
             ),
             Tool(
@@ -193,12 +214,16 @@ public final class MCPProtocolHandler {
                 inputSchema: [
                     "type": "object",
                     "properties": [
+                        "project_path": [
+                            "type": "string",
+                            "description": "Path to the Swift project to analyze"
+                        ],
                         "symbol_name": [
                             "type": "string",
                             "description": "Name of the symbol to analyze"
                         ]
                     ],
-                    "required": ["symbol_name"]
+                    "required": ["project_path", "symbol_name"]
                 ]
             ),
             Tool(
@@ -206,22 +231,32 @@ public final class MCPProtocolHandler {
                 description: "Create comprehensive project documentation and memory",
                 inputSchema: [
                     "type": "object",
-                    "properties": [:],
-                    "required": []
+                    "properties": [
+                        "project_path": [
+                            "type": "string",
+                            "description": "Path to the Swift project to analyze"
+                        ]
+                    ],
+                    "required": ["project_path"]
                 ]
             ),
             Tool(
-                name: "generate_migration_plan", 
+                name: "generate_migration_plan",
                 description: "Generate a plan to migrate to a different architecture pattern",
                 inputSchema: [
                     "type": "object",
                     "properties": [
+                        "project_path": [
+                            "type": "string",
+                            "description": "Path to the Swift project to analyze"
+                        ],
                         "target_architecture": [
                             "type": "string",
-                            "description": "Target architecture pattern (mvvm, features_based, viper, clean_architecture)"
+                            "description": "Target architecture pattern",
+                            "enum": ["MVC", "MVVM", "VIPER", "Features-based", "Clean Architecture", "Modular", "Custom"]
                         ]
                     ],
-                    "required": ["target_architecture"]
+                    "required": ["project_path", "target_architecture"]
                 ]
             ),
             Tool(
@@ -302,7 +337,7 @@ public final class MCPProtocolHandler {
         return MCPResponse(
             jsonrpc: "2.0",
             id: request.id,
-            result: try JSONSerialization.data(withJSONObject: toDictionary(result))
+            result: AnyCodable(try toDictionary(result))
         )
     }
     
@@ -359,23 +394,115 @@ public final class MCPProtocolHandler {
                 ToolContent(type: "text", text: String(describing: result))
             ]
         )
-        
+
         return MCPResponse(
             jsonrpc: "2.0",
             id: request.id,
-            result: try JSONSerialization.data(withJSONObject: toDictionary(toolResult))
+            result: AnyCodable(try toDictionary(toolResult))
         )
     }
-    
+
+    // MARK: - Helper Functions
+
+    /// Extracts the symbol name at a given position in a file
+    private func extractSymbolAtPosition(filePath: String, line: Int, character: Int) throws -> String? {
+        let fileURL: URL
+        if filePath.hasPrefix("/") {
+            fileURL = URL(fileURLWithPath: filePath)
+        } else {
+            // Relative path - resolve against workspace
+            fileURL = swiftLanguageServer.workspaceURL.appendingPathComponent(filePath)
+        }
+
+        guard let content = try? String(contentsOf: fileURL) else {
+            logger.warning("Could not read file: \(filePath)")
+            return nil
+        }
+
+        let lines = content.components(separatedBy: .newlines)
+        guard line < lines.count else {
+            logger.warning("Line \(line) out of bounds in \(filePath)")
+            return nil
+        }
+
+        let targetLine = lines[line]
+        guard character < targetLine.count else {
+            logger.warning("Character \(character) out of bounds in line \(line)")
+            return nil
+        }
+
+        // Extract identifier at position (Swift identifiers: letters, digits, underscores, Unicode)
+        let lineChars = Array(targetLine)
+        var start = character
+        var end = character
+
+        // Expand backwards to find start of identifier
+        while start > 0 && isIdentifierChar(lineChars[start - 1]) {
+            start -= 1
+        }
+
+        // Expand forwards to find end of identifier
+        while end < lineChars.count && isIdentifierChar(lineChars[end]) {
+            end += 1
+        }
+
+        if start < end {
+            let symbol = String(lineChars[start..<end])
+            logger.debug("Extracted symbol '\(symbol)' at \(filePath):\(line):\(character)")
+            return symbol
+        }
+
+        return nil
+    }
+
+    /// Checks if a character is valid in a Swift identifier
+    private func isIdentifierChar(_ char: Character) -> Bool {
+        return char.isLetter || char.isNumber || char == "_"
+    }
+
     // MARK: - Tool Implementations
-    
+
     private func handleFindSymbols(_ arguments: [String: Any]) async throws -> [SymbolInfo] {
         guard let filePath = arguments["file_path"] as? String,
               let namePattern = arguments["name_pattern"] as? String else {
             throw MCPError.invalidParams
         }
-        
-        return try await swiftLanguageServer.findSymbols(in: filePath, namePattern: namePattern)
+
+        // Convert glob-style patterns to regex
+        // "*" -> ".*", "?" -> ".", or use as-is if already looks like regex
+        var regexPattern = namePattern
+        if namePattern == "*" || namePattern == ".*" {
+            // Match everything - use empty pattern which SymbolSearchEngine treats as "match all"
+            regexPattern = ""
+        } else if namePattern.hasPrefix("*") || namePattern.hasSuffix("*") {
+            // Convert glob wildcards to regex
+            regexPattern = namePattern.replacingOccurrences(of: "*", with: ".*")
+                                     .replacingOccurrences(of: "?", with: ".")
+        }
+
+        // Use the real SymbolSearchEngine implementation instead of mocked SwiftLanguageServer
+        let allSymbols = try await symbolSearchEngine.findSymbols(
+            namePattern: regexPattern,
+            symbolType: "",
+            useRegex: !regexPattern.isEmpty,
+            includePrivate: false,
+            includeInherited: false
+        )
+
+        // Filter to only symbols from the specified file or directory
+        // Handle both absolute paths and relative filenames
+        if !filePath.hasPrefix("/") {
+            // Relative path - just match on filename
+            return allSymbols.filter { symbol in
+                symbol.location.uri.hasSuffix(filePath)
+            }
+        } else {
+            // Absolute path - match the full path
+            let normalizedPath = URL(fileURLWithPath: filePath).standardizedFileURL.path
+            return allSymbols.filter { symbol in
+                symbol.location.uri.contains(normalizedPath)
+            }
+        }
     }
     
     private func handleFindReferences(_ arguments: [String: Any]) async throws -> [String] {
@@ -384,11 +511,26 @@ public final class MCPProtocolHandler {
               let character = arguments["character"] as? Int else {
             throw MCPError.invalidParams
         }
-        
-        let position = Position(line: line, character: character)
-        let locations = try await swiftLanguageServer.findReferences(at: position, in: filePath)
-        
-        return locations.map { "\($0.uri):\($0.line):\($0.character)" }
+
+        // Extract symbol name at the specified position
+        guard let symbolName = try extractSymbolAtPosition(filePath: filePath, line: line, character: character) else {
+            logger.warning("No symbol found at \(filePath):\(line):\(character)")
+            return []
+        }
+
+        logger.debug("Finding references for symbol: \(symbolName)")
+
+        // Use real SymbolSearchEngine to find references
+        let references = try await symbolSearchEngine.findReferences(
+            symbolName: symbolName,
+            symbolType: "",
+            includeComments: false
+        )
+
+        // Convert to location strings
+        return references.map { ref in
+            "\(ref.file):\(ref.line):\(ref.character)"
+        }
     }
     
     private func handleGetDefinition(_ arguments: [String: Any]) async throws -> [String] {
@@ -397,11 +539,29 @@ public final class MCPProtocolHandler {
               let character = arguments["character"] as? Int else {
             throw MCPError.invalidParams
         }
-        
-        let position = Position(line: line, character: character)
-        let locations = try await swiftLanguageServer.getDefinition(at: position, in: filePath)
-        
-        return locations.map { "\($0.targetUri):\($0.targetRange.start.line):\($0.targetRange.start.character)" }
+
+        // Extract symbol name at the specified position
+        guard let symbolName = try extractSymbolAtPosition(filePath: filePath, line: line, character: character) else {
+            logger.warning("No symbol found at \(filePath):\(line):\(character)")
+            return []
+        }
+
+        logger.debug("Finding definition for symbol: \(symbolName)")
+
+        // Use real SymbolSearchEngine to find symbol definitions
+        let symbols = try await symbolSearchEngine.findSymbols(
+            namePattern: symbolName,
+            symbolType: "",
+            useRegex: false,
+            includePrivate: true,
+            includeInherited: false
+        )
+
+        // Filter to exact matches (not partial) and return definition locations
+        let definitions = symbols.filter { $0.name == symbolName }
+        return definitions.map { symbol in
+            "\(symbol.location.uri):\(symbol.location.line):\(symbol.location.character)"
+        }
     }
     
     private func handleGetHoverInfo(_ arguments: [String: Any]) async throws -> String {
@@ -410,26 +570,56 @@ public final class MCPProtocolHandler {
               let character = arguments["character"] as? Int else {
             throw MCPError.invalidParams
         }
-        
-        let position = Position(line: line, character: character)
-        let hover = try await swiftLanguageServer.getHover(at: position, in: filePath)
-        
-        if case .markupContent(let content) = hover?.contents {
-            return content.value
-        } else if case .markedString(let string) = hover?.contents {
-            return string.value
+
+        // Extract symbol name at the specified position
+        guard let symbolName = try extractSymbolAtPosition(filePath: filePath, line: line, character: character) else {
+            logger.warning("No symbol found at \(filePath):\(line):\(character)")
+            return "No hover information available"
         }
-        
-        return "No hover information available"
+
+        logger.debug("Getting hover info for symbol: \(symbolName)")
+
+        // Use real SymbolSearchEngine to find symbol information
+        let symbols = try await symbolSearchEngine.findSymbols(
+            namePattern: symbolName,
+            symbolType: "",
+            useRegex: false,
+            includePrivate: true,
+            includeInherited: false
+        )
+
+        // Find exact match
+        guard let symbol = symbols.first(where: { $0.name == symbolName }) else {
+            return "No hover information available"
+        }
+
+        // Format hover information
+        var hoverText = "\(symbol.kind): \(symbol.name)"
+        if let container = symbol.containerName {
+            hoverText += "\nContainer: \(container)"
+        }
+        if let detail = symbol.detail {
+            hoverText += "\n\(detail)"
+        }
+        hoverText += "\nLocation: \(symbol.location.uri):\(symbol.location.line)"
+
+        return hoverText
     }
     
     private func handleFormatDocument(_ arguments: [String: Any]) async throws -> [String] {
         guard let filePath = arguments["file_path"] as? String else {
             throw MCPError.invalidParams
         }
-        
-        let edits = try await swiftLanguageServer.formatDocument(at: filePath)
-        return edits.map { "Line \($0.range.start.line): \($0.newText)" }
+
+        logger.debug("Format document requested for: \(filePath)")
+
+        // Note: Real Swift formatting requires external tools like swift-format or SwiftFormat
+        // Since we don't have a formatter integrated, we return no edits
+        // To enable formatting, consider integrating:
+        // - swift-format: https://github.com/apple/swift-format
+        // - SwiftFormat: https://github.com/nicklockwood/SwiftFormat
+
+        return ["Document formatting requires external tools (swift-format or SwiftFormat)"]
     }
     
     // MARK: - Resources
@@ -448,7 +638,7 @@ public final class MCPProtocolHandler {
         return MCPResponse(
             jsonrpc: "2.0",
             id: request.id,
-            result: try JSONSerialization.data(withJSONObject: toDictionary(result))
+            result: AnyCodable(try toDictionary(result))
         )
     }
     
@@ -482,11 +672,11 @@ public final class MCPProtocolHandler {
                 )
             ]
         )
-        
+
         return MCPResponse(
             jsonrpc: "2.0",
             id: request.id,
-            result: try JSONSerialization.data(withJSONObject: toDictionary(result))
+            result: AnyCodable(try toDictionary(result))
         )
     }
     

@@ -56,9 +56,20 @@ public final class StdioTransport: @unchecked Sendable {
                 logger.trace("Sent STDIO response: \(response)")
             } catch {
                 logger.error("Error processing request: \(error)")
-                
+
+                // Parse request ID if possible
+                var requestId: RequestID? = nil
+                if let data = line.data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    if let idValue = json["id"] as? Int {
+                        requestId = .number(idValue)
+                    } else if let idValue = json["id"] as? String {
+                        requestId = .string(idValue)
+                    }
+                }
+
                 // Send error response
-                let errorResponse = createErrorResponse(error: error)
+                let errorResponse = createErrorResponse(error: error, id: requestId)
                 print(errorResponse)
                 fflush(stdout)
             }
@@ -91,26 +102,26 @@ public final class StdioTransport: @unchecked Sendable {
         return responseString
     }
     
-    private func createErrorResponse(error: Error) -> String {
+    private func createErrorResponse(error: Error, id: RequestID?) -> String {
         let mcpError: MCPError
         if let existingMCPError = error as? MCPError {
             mcpError = existingMCPError
         } else {
             mcpError = .internalError
         }
-        
+
         let errorResponse = MCPResponse(
-            id: nil,
+            id: id,
             result: nil,
             error: mcpError
         )
-        
+
         do {
             let encoder = JSONEncoder()
             let data = try encoder.encode(errorResponse)
-            return String(data: data, encoding: .utf8) ?? "{\"error\": \"Unknown error\"}"
+            return String(data: data, encoding: .utf8) ?? "{\"jsonrpc\": \"2.0\", \"error\": {\"code\": -32603, \"message\": \"Unknown error\"}}"
         } catch {
-            return "{\"error\": \"Failed to encode error response\"}"
+            return "{\"jsonrpc\": \"2.0\", \"error\": {\"code\": -32603, \"message\": \"Failed to encode error response\"}}"
         }
     }
     

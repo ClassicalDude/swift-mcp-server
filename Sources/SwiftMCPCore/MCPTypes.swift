@@ -104,14 +104,66 @@ public struct MCPRequest: Codable {
 public struct MCPResponse: Codable, Sendable {
     public let jsonrpc: String
     public let id: RequestID?
-    public let result: Data?
+    public let result: AnyCodable?
     public let error: MCPError?
-    
-    public init(jsonrpc: String = "2.0", id: RequestID?, result: Data? = nil, error: MCPError? = nil) {
+
+    public init(jsonrpc: String = "2.0", id: RequestID?, result: AnyCodable? = nil, error: MCPError? = nil) {
         self.jsonrpc = jsonrpc
         self.id = id
         self.result = result
         self.error = error
+    }
+}
+
+// Helper type to encode/decode Any values
+public struct AnyCodable: Codable, Sendable {
+    public let value: Any
+
+    public init(_ value: Any) {
+        self.value = value
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+
+        if let bool = try? container.decode(Bool.self) {
+            value = bool
+        } else if let int = try? container.decode(Int.self) {
+            value = int
+        } else if let double = try? container.decode(Double.self) {
+            value = double
+        } else if let string = try? container.decode(String.self) {
+            value = string
+        } else if let dict = try? container.decode([String: AnyCodable].self) {
+            value = dict.mapValues { $0.value }
+        } else if let array = try? container.decode([AnyCodable].self) {
+            value = array.map { $0.value }
+        } else {
+            value = [:]
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+
+        switch value {
+        case let bool as Bool:
+            try container.encode(bool)
+        case let int as Int:
+            try container.encode(int)
+        case let double as Double:
+            try container.encode(double)
+        case let string as String:
+            try container.encode(string)
+        case let dict as [String: Any]:
+            let codableDict = dict.mapValues { AnyCodable($0) }
+            try container.encode(codableDict)
+        case let array as [Any]:
+            let codableArray = array.map { AnyCodable($0) }
+            try container.encode(codableArray)
+        default:
+            try container.encodeNil()
+        }
     }
 }
 
@@ -306,19 +358,76 @@ public struct Tool: Codable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(name, forKey: .name)
         try container.encode(description, forKey: .description)
-        
-        // Encode inputSchema as nested JSON
-        var schemaContainer = container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .inputSchema)
-        for (key, value) in inputSchema {
-            let codingKey = DynamicCodingKey(stringValue: key)!
-            if let stringValue = value as? String {
-                try schemaContainer.encode(stringValue, forKey: codingKey)
-            } else if let intValue = value as? Int {
-                try schemaContainer.encode(intValue, forKey: codingKey)
-            } else if let boolValue = value as? Bool {
-                try schemaContainer.encode(boolValue, forKey: codingKey)
-            } else if let doubleValue = value as? Double {
-                try schemaContainer.encode(doubleValue, forKey: codingKey)
+
+        // Convert inputSchema dictionary to JSON data, then encode it
+        // This properly handles nested dictionaries and arrays
+        let jsonData = try JSONSerialization.data(withJSONObject: inputSchema, options: [])
+        let jsonObject = try JSONSerialization.jsonObject(with: jsonData, options: [])
+
+        // Encode the JSON object using a custom helper
+        try encodeJSONValue(jsonObject, to: &container, forKey: .inputSchema)
+    }
+
+    // Helper function to recursively encode any JSON value
+    private func encodeJSONValue(_ value: Any, to container: inout KeyedEncodingContainer<CodingKeys>, forKey key: CodingKeys) throws {
+        if let dict = value as? [String: Any] {
+            var nestedContainer = container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: key)
+            for (k, v) in dict {
+                let codingKey = DynamicCodingKey(stringValue: k)!
+                try encodeJSONValueInNested(v, to: &nestedContainer, forKey: codingKey)
+            }
+        } else if let array = value as? [Any] {
+            var nestedContainer = container.nestedUnkeyedContainer(forKey: key)
+            for item in array {
+                try encodeJSONValueInUnkeyed(item, to: &nestedContainer)
+            }
+        }
+    }
+
+    // Helper to encode values in nested containers
+    private func encodeJSONValueInNested(_ value: Any, to container: inout KeyedEncodingContainer<DynamicCodingKey>, forKey key: DynamicCodingKey) throws {
+        if let string = value as? String {
+            try container.encode(string, forKey: key)
+        } else if let int = value as? Int {
+            try container.encode(int, forKey: key)
+        } else if let double = value as? Double {
+            try container.encode(double, forKey: key)
+        } else if let bool = value as? Bool {
+            try container.encode(bool, forKey: key)
+        } else if let dict = value as? [String: Any] {
+            var nestedContainer = container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: key)
+            for (k, v) in dict {
+                let nestedKey = DynamicCodingKey(stringValue: k)!
+                try encodeJSONValueInNested(v, to: &nestedContainer, forKey: nestedKey)
+            }
+        } else if let array = value as? [Any] {
+            var nestedContainer = container.nestedUnkeyedContainer(forKey: key)
+            for item in array {
+                try encodeJSONValueInUnkeyed(item, to: &nestedContainer)
+            }
+        }
+    }
+
+    // Helper to encode values in unkeyed containers (arrays)
+    private func encodeJSONValueInUnkeyed(_ value: Any, to container: inout UnkeyedEncodingContainer) throws {
+        if let string = value as? String {
+            try container.encode(string)
+        } else if let int = value as? Int {
+            try container.encode(int)
+        } else if let double = value as? Double {
+            try container.encode(double)
+        } else if let bool = value as? Bool {
+            try container.encode(bool)
+        } else if let dict = value as? [String: Any] {
+            var nestedContainer = container.nestedContainer(keyedBy: DynamicCodingKey.self)
+            for (k, v) in dict {
+                let key = DynamicCodingKey(stringValue: k)!
+                try encodeJSONValueInNested(v, to: &nestedContainer, forKey: key)
+            }
+        } else if let array = value as? [Any] {
+            var nestedContainer = container.nestedUnkeyedContainer()
+            for item in array {
+                try encodeJSONValueInUnkeyed(item, to: &nestedContainer)
             }
         }
     }
